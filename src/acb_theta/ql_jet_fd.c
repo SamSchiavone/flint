@@ -17,6 +17,86 @@
 #include "gr_dft.h"
 #include "acb_theta.h"
 
+/* Cheap, uniform error bound for ord = 0: if |theta_{a,b}(.,tau)| <= c on the
+   polydisc of radius rho around z (acb_theta_ql_local_bound), then by Cauchy's
+   estimates |d theta / dz_j| <= c/rho and |d^2 theta / dz_j dz_k| <= 2c/rho^2,
+   and by the heat equation d/dtau_{jk} = (2 pi i (1 + delta_{jk}))^{-1} d^2/dz_j dz_k,
+   so |d theta / dtau_{jk}| <= c / (2 pi rho^2) for all j <= k. */
+
+static void
+acb_theta_ql_jet_error_cheap(arb_t err, acb_srcptr z, const acb_mat_t tau)
+{
+    slong g = acb_mat_nrows(tau);
+    slong lp = ACB_THETA_LOW_PREC;
+    arb_t c, rho, t, u, pi;
+    arf_t half;
+    slong j, k;
+
+    arb_init(c);
+    arb_init(rho);
+    arb_init(t);
+    arb_init(u);
+    arb_init(pi);
+    arf_init(half);
+
+    acb_theta_ql_local_bound(c, rho, z, tau, 0);
+    arb_get_ubound_arf(arb_midref(c), c, lp);
+    mag_zero(arb_radref(c));
+    arb_get_lbound_arf(arb_midref(rho), rho, lp);
+    mag_zero(arb_radref(rho));
+    arb_const_pi(pi, lp);
+    arf_set_d(half, 0.5);
+
+    /* u = sum of radii of tau_{jk}, j <= k */
+    arb_zero(u);
+    for (j = 0; j < g; j++)
+    {
+        for (k = j; k < g; k++)
+        {
+            arb_zero(t);
+            acb_get_rad_ubound_arf(arb_midref(t), acb_mat_entry(tau, j, k), lp);
+            arb_add(u, u, t, lp);
+        }
+    }
+    arb_sqr(t, rho, lp);
+    arb_mul(t, t, pi, lp);
+    arb_mul_2exp_si(t, t, 1);
+    arb_div(err, c, t, lp);
+    arb_mul(err, err, u, lp);
+
+    /* add sum of radii of z_j times c/rho (theta is 1-periodic in re(z)) */
+    arb_zero(u);
+    for (j = 0; j < g; j++)
+    {
+        arb_zero(t);
+        arf_set_mag(arb_midref(t), arb_radref(acb_realref(&z[j])));
+        arf_min(arb_midref(t), arb_midref(t), half);
+        arb_sqr(t, t, lp);
+        {
+            arb_t im;
+            arb_init(im);
+            arf_set_mag(arb_midref(im), arb_radref(acb_imagref(&z[j])));
+            arb_sqr(im, im, lp);
+            arb_add(t, t, im, lp);
+            arb_clear(im);
+        }
+        arb_sqrt(t, t, lp);
+        arb_add(u, u, t, lp);
+    }
+    arb_div(t, c, rho, lp);
+    arb_mul(t, t, u, lp);
+    arb_add(err, err, t, lp);
+    arb_get_ubound_arf(arb_midref(err), err, lp);
+    mag_zero(arb_radref(err));
+
+    arb_clear(c);
+    arb_clear(rho);
+    arb_clear(t);
+    arb_clear(u);
+    arb_clear(pi);
+    arf_clear(half);
+}
+
 static void
 acb_theta_ql_inexact(acb_ptr th, acb_srcptr zs, slong nb, const acb_mat_t tau,
     acb_srcptr dth, int all, slong prec)
@@ -65,13 +145,28 @@ acb_theta_ql_inexact(acb_ptr th, acb_srcptr zs, slong nb, const acb_mat_t tau,
         acb_get_mid(&new_zs[g * add_zero + j], &zs[j]);
     }
 
-    /* Get error bounds */
-    for (j = 0; j < nb; j++)
+    /* Get error bounds: uniform Cauchy bound if dth == NULL, otherwise the
+       tighter bound from low-precision derivatives */
+    if (dth == NULL)
     {
-        for (k = 0; k < nbth; k++)
+        for (j = 0; j < nb; j++)
         {
-            acb_theta_ql_jet_error(err + j * nbth + k, zs + j * g, tau,
-                dth + j * (nbth * nbjet) + k * nbjet, 0, lp);
+            acb_theta_ql_jet_error_cheap(err + j * nbth, zs + j * g, tau);
+            for (k = 1; k < nbth; k++)
+            {
+                arb_set(err + j * nbth + k, err + j * nbth);
+            }
+        }
+    }
+    else
+    {
+        for (j = 0; j < nb; j++)
+        {
+            for (k = 0; k < nbth; k++)
+            {
+                acb_theta_ql_jet_error(err + j * nbth + k, zs + j * g, tau,
+                    dth + j * (nbth * nbjet) + k * nbjet, 0, lp);
+            }
         }
     }
 
@@ -361,6 +456,18 @@ acb_theta_ql_jet_fd(acb_ptr th, acb_srcptr zs, slong nb,
 
     if (nb <= 0)
     {
+        return;
+    }
+
+    if (ord == 0)
+    {
+        /* No derivatives are needed for the output, so skip the costly
+           low-precision evaluation of second-order derivatives of all 4^g
+           theta functions that was only used to propagate the input error:
+           acb_theta_ql_inexact uses a uniform Cauchy bound instead. This
+           bound is crude, so callers should pass (zs, tau) with radii well
+           below 2^(-prec) (acb_theta_jet reduces with guard bits for this). */
+        acb_theta_ql_inexact(th, zs, nb, tau, NULL, all, prec);
         return;
     }
 

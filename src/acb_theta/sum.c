@@ -15,6 +15,7 @@
 #include "arb_mat.h"
 #include "acb_mat.h"
 #include "acb_modular.h"
+#include "thread_support.h"
 #include "acb_theta.h"
 
 static void
@@ -212,6 +213,61 @@ acb_theta_ctx_z_shift_a0(acb_theta_ctx_z_t res, acb_t c, const acb_theta_ctx_z_t
     arb_clear(abs);
 }
 
+typedef struct
+{
+    acb_ptr th;
+    const acb_theta_ctx_z_struct * vec;
+    slong nb;
+    const struct acb_theta_ctx_tau_struct * ctx_tau;
+    arb_srcptr distances;
+    int all_b;
+    slong prec;
+} acb_theta_sum_all_a_args_t;
+
+static void
+acb_theta_sum_all_a_worker(slong a, void * args_)
+{
+    acb_theta_sum_all_a_args_t * args = args_;
+    const struct acb_theta_ctx_tau_struct * ctx_tau = args->ctx_tau;
+    slong g = ctx_tau->g;
+    slong n = 1 << g;
+    slong nb = args->nb;
+    slong nbb = (args->all_b ? n : 1);
+    slong nbab = n * nbb;
+    slong prec = args->prec;
+    slong guard = ACB_THETA_LOW_PREC;
+    acb_theta_ctx_z_struct * new_vec;
+    acb_ptr res, cs;
+    slong j, b, dot;
+
+    new_vec = acb_theta_ctx_z_vec_init(nb, g);
+    res = _acb_vec_init(nbb * nb);
+    cs = _acb_vec_init(nb);
+
+    for (j = 0; j < nb; j++)
+    {
+        acb_theta_ctx_z_shift_a0(&new_vec[j], &cs[j], &args->vec[j], ctx_tau, a, prec + guard);
+    }
+    acb_theta_sum_0x(res, new_vec, nb, ctx_tau, &args->distances[a], args->all_b, prec);
+    for (j = 0; j < nb; j++)
+    {
+        _acb_vec_scalar_mul(args->th + nbab * j + nbb * a, res + nbb * j,
+            nbb, &cs[j], prec + guard);
+    }
+    for (b = 1; b < nbb; b++) /* No sign changes for b=0 */
+    {
+        dot = acb_theta_char_dot(a, b, g);
+        for (j = 0; j < nb; j++)
+        {
+            acb_mul_i_pow_si(&args->th[nbab * j + nbb * a + b], &args->th[nbab * j + nbb * a + b], dot);
+        }
+    }
+
+    acb_theta_ctx_z_vec_clear(new_vec, nb);
+    _acb_vec_clear(res, nbb * nb);
+    _acb_vec_clear(cs, nb);
+}
+
 void
 acb_theta_sum(acb_ptr th, const acb_theta_ctx_z_struct * vec, slong nb,
     const acb_theta_ctx_tau_t ctx_tau, arb_srcptr distances, int all_a,
@@ -223,10 +279,9 @@ acb_theta_sum(acb_ptr th, const acb_theta_ctx_z_struct * vec, slong nb,
     slong nbb = (all_b ? n : 1);
     slong nbab = nba * nbb;
     slong guard = ACB_THETA_LOW_PREC;
-    acb_theta_ctx_z_struct * new_vec;
-    acb_ptr cs, res;
-    slong new_prec, dot;
-    slong j, a, b;
+    acb_ptr res;
+    slong new_prec;
+    slong j;
 
     FLINT_ASSERT(nb >= 0);
     if (nb == 0)
@@ -278,35 +333,12 @@ acb_theta_sum(acb_ptr th, const acb_theta_ctx_z_struct * vec, slong nb,
     }
     else if (all_a)
     {
-        new_vec = acb_theta_ctx_z_vec_init(nb, g);
-        res = _acb_vec_init(nbb * nb);
-        cs = _acb_vec_init(nb);
-
-        for (a = 0; a < n; a++)
-        {
-            for (j = 0; j < nb; j++)
-            {
-                acb_theta_ctx_z_shift_a0(&new_vec[j], &cs[j], &vec[j], ctx_tau, a, prec + guard);
-            }
-            acb_theta_sum_0x(res, new_vec, nb, ctx_tau, &distances[a], all_b, prec);
-            for (j = 0; j < nb; j++)
-            {
-                _acb_vec_scalar_mul(th + nbab * j + nbb * a, res + nbb * j,
-                    nbb, &cs[j], prec + guard);
-            }
-            for (b = 1; b < nbb; b++) /* No sign changes for b=0 */
-            {
-                dot = acb_theta_char_dot(a, b, g);
-                for (j = 0; j < nb; j++)
-                {
-                    acb_mul_i_pow_si(&th[nbab * j + nbb * a + b], &th[nbab * j + nbb * a + b], dot);
-                }
-            }
-        }
-
-        acb_theta_ctx_z_vec_clear(new_vec, nb);
-        _acb_vec_clear(res, nbb * nb);
-        _acb_vec_clear(cs, nb);
+        /* The 2^g summations (one per characteristic a) are independent:
+           run them with flint_parallel_do when several threads are enabled. */
+        acb_theta_sum_all_a_args_t args;
+        args.th = th; args.vec = vec; args.nb = nb; args.ctx_tau = ctx_tau;
+        args.distances = distances; args.all_b = all_b; args.prec = prec;
+        flint_parallel_do(acb_theta_sum_all_a_worker, &args, n, -1, FLINT_PARALLEL_STRIDED);
     }
     else
     {

@@ -30,7 +30,7 @@ acb_theta_jet(acb_ptr th, acb_srcptr zs, slong nb, const acb_mat_t tau,
     acb_t s, t;
     ulong * ch;
     slong * e;
-    slong kappa, j, k;
+    slong kappa, j, k, red_prec;
     int res;
 
     if (nb <= 0)
@@ -57,10 +57,15 @@ acb_theta_jet(acb_ptr th, acb_srcptr zs, slong nb, const acb_mat_t tau,
     ch = flint_malloc(nbth * sizeof(ulong));
     e = flint_malloc(nbth * sizeof(slong));
 
-    res = acb_theta_reduce_tau(new_zs, new_tau, mat, N, ct, exps, zs, nb, tau, prec);
+    /* Reduce with guard bits so that the radii of (new_zs, new_tau) are well
+       below 2^(-prec): the error propagation in acb_theta_ql_jet_fd then costs
+       no output precision even with a crude derivative bound. The reduction
+       itself is O(g^3) multiplications, hence negligible. */
+    red_prec = prec + ACB_THETA_LOW_PREC + 8 * g;
+    res = acb_theta_reduce_tau(new_zs, new_tau, mat, N, ct, exps, zs, nb, tau, red_prec);
     if (res)
     {
-        res = acb_theta_reduce_z(new_zs, rs, cs, new_zs, nb, new_tau, prec);
+        res = acb_theta_reduce_z(new_zs, rs, cs, new_zs, nb, new_tau, red_prec);
     }
 
     if (res)
